@@ -3,6 +3,8 @@ export const metadata = {
   description: "Advertising panel app for customers to upload and display media content",
 };
 
+import NavigationMenu from "@/components/ui/navigation-menu";
+
 export default function RootLayout({
   children,
 }: {
@@ -10,7 +12,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="bg-white text-black">
-      <body>{children}</body>
+      <body>
+        <NavigationMenu />
+        {children}
+      </body>
     </html>
   );
 }
