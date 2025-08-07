@@ -9,6 +9,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
+const Razorpay = require('razorpay');
 
 const app = express();
 const server = http.createServer(app);
@@ -31,6 +32,9 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
 });
+
+// Razorpay instance (will be initialized after loading keys)
+let razorpayInstance = null;
 
 // Middleware
 app.use(cors());
@@ -75,6 +79,30 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
+
+// Load Razorpay keys from DB and initialize instance
+async function loadRazorpayKeys() {
+  try {
+    const [rows] = await pool.query('SELECT razorpay_key_id, razorpay_key_secret FROM payment_settings ORDER BY updated_at DESC LIMIT 1');
+    if (rows.length === 0) {
+      console.warn('Razorpay keys not configured');
+      razorpayInstance = null;
+      return;
+    }
+    const { razorpay_key_id, razorpay_key_secret } = rows[0];
+    razorpayInstance = new Razorpay({
+      key_id: razorpay_key_id,
+      key_secret: razorpay_key_secret,
+    });
+    console.log('Razorpay instance initialized');
+  } catch (error) {
+    console.error('Error loading Razorpay keys:', error);
+    razorpayInstance = null;
+  }
+}
+
+// Call loadRazorpayKeys on server start
+loadRazorpayKeys();
 
 // Routes
 
@@ -173,6 +201,144 @@ app.post('/api/link/generate', authenticateToken, async (req, res) => {
     console.error('Link generation error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// Get media content for link playback
+app.get('/api/link/:code/content', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const [links] = await pool.query('SELECT * FROM links WHERE link_code = ? AND expires_at > NOW()', [code]);
+    if (links.length === 0) {
+      return res.status(404).json({ error: 'Link not found or expired' });
+    }
+    const link = links[0];
+    const [media] = await pool.query('SELECT * FROM media WHERE group_id = ? AND user_id = ?', [link.group_id, link.user_id]);
+    res.json({ media });
+  } catch (error) {
+    console.error('Link content error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Payment settings APIs for super admin
+
+// Get payment settings
+app.get('/api/admin/payment-settings', authenticateToken, async (req, res) => {
+  try {
+    // TODO: Verify super admin role from req.user
+    const [rows] = await pool.query('SELECT razorpay_key_id, razorpay_key_secret FROM payment_settings ORDER BY updated_at DESC LIMIT 1');
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Payment settings not configured' });
+    }
+    const { razorpay_key_id } = rows[0];
+    res.json({ razorpay_key_id });
+  } catch (error) {
+    console.error('Get payment settings error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update payment settings
+app.post('/api/admin/payment-settings', authenticateToken, async (req, res) => {
+  try {
+    // TODO: Verify super admin role from req.user
+    const { razorpay_key_id, razorpay_key_secret } = req.body;
+    if (!(razorpay_key_id && razorpay_key_secret)) {
+      return res.status(400).json({ error: 'Razorpay key ID and secret are required' });
+    }
+    await pool.query('INSERT INTO payment_settings (razorpay_key_id, razorpay_key_secret) VALUES (?, ?)', [razorpay_key_id, razorpay_key_secret]);
+    // Reload Razorpay instance
+    await loadRazorpayKeys();
+    res.json({ message: 'Payment settings updated' });
+  } catch (error) {
+    console.error('Update payment settings error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create Razorpay order for package purchase
+app.post('/api/payment/create-order', authenticateToken, async (req, res) => {
+  try {
+    if (!razorpayInstance) {
+      return res.status(500).json({ error: 'Payment gateway not configured' });
+    }
+    const { packageId } = req.body;
+    if (!packageId) {
+      return res.status(400).json({ error: 'Package ID is required' });
+    }
+    // Fetch package details
+    const [packages] = await pool.query('SELECT * FROM packages WHERE id = ?', [packageId]);
+    if (packages.length === 0) {
+      return res.status(404).json({ error: 'Package not found' });
+    }
+    const pkg = packages[0];
+    const options = {
+      amount: pkg.price * 100, // amount in paise
+      currency: "INR",
+      receipt: `receipt_${Date.now()}`,
+      payment_capture: 1,
+    };
+    const order = await razorpayInstance.orders.create(options);
+    res.json({ order });
+  } catch (error) {
+    console.error('Create order error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Verify Razorpay payment
+app.post('/api/payment/verify', authenticateToken, async (req, res) => {
+  try {
+    if (!razorpayInstance) {
+      return res.status(500).json({ error: 'Payment gateway not configured' });
+    }
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!(razorpay_order_id && razorpay_payment_id && razorpay_signature)) {
+      return res.status(400).json({ error: 'Payment details are required' });
+    }
+    const crypto = require('crypto');
+    const generated_signature = crypto.createHmac('sha256', razorpayInstance.key_secret)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest('hex');
+    if (generated_signature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid payment signature' });
+    }
+    // TODO: Update user package subscription status in DB
+    res.json({ message: 'Payment verified successfully' });
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Offline payment recording API (extend as needed)
+app.post('/api/payment/offline', authenticateToken, async (req, res) => {
+  try {
+    // TODO: Implement offline payment recording and update subscription
+    res.json({ message: 'Offline payment recorded (placeholder)' });
+  } catch (error) {
+    console.error('Offline payment error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// WebSocket connection for real-time updates and live preview
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+
+  // Join room for user updates
+  socket.on('joinUserRoom', (userId) => {
+    socket.join(`user_${userId}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+  });
+});
+
+// Start server
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
 
 // Get media content for link playback
