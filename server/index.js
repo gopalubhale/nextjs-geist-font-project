@@ -222,10 +222,19 @@ app.get('/api/link/:code/content', async (req, res) => {
 
 // Payment settings APIs for super admin
 
+// Middleware to verify super admin role
+function verifySuperAdmin(req, res, next) {
+  // For simplicity, assume user with email 'admin@gnetworkservices.in' is super admin
+  if (req.user && req.user.email === 'admin@gnetworkservices.in') {
+    next();
+  } else {
+    res.status(403).json({ error: 'Forbidden: Super admin only' });
+  }
+}
+
 // Get payment settings
-app.get('/api/admin/payment-settings', authenticateToken, async (req, res) => {
+app.get('/api/admin/payment-settings', authenticateToken, verifySuperAdmin, async (req, res) => {
   try {
-    // TODO: Verify super admin role from req.user
     const [rows] = await pool.query('SELECT razorpay_key_id, razorpay_key_secret FROM payment_settings ORDER BY updated_at DESC LIMIT 1');
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Payment settings not configured' });
@@ -239,15 +248,13 @@ app.get('/api/admin/payment-settings', authenticateToken, async (req, res) => {
 });
 
 // Update payment settings
-app.post('/api/admin/payment-settings', authenticateToken, async (req, res) => {
+app.post('/api/admin/payment-settings', authenticateToken, verifySuperAdmin, async (req, res) => {
   try {
-    // TODO: Verify super admin role from req.user
     const { razorpay_key_id, razorpay_key_secret } = req.body;
     if (!(razorpay_key_id && razorpay_key_secret)) {
       return res.status(400).json({ error: 'Razorpay key ID and secret are required' });
     }
     await pool.query('INSERT INTO payment_settings (razorpay_key_id, razorpay_key_secret) VALUES (?, ?)', [razorpay_key_id, razorpay_key_secret]);
-    // Reload Razorpay instance
     await loadRazorpayKeys();
     res.json({ message: 'Payment settings updated' });
   } catch (error) {
