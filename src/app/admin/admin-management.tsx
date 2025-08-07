@@ -31,7 +31,7 @@ export default function AdminManagement() {
       }
       const data = await res.json();
       setCustomers(data.customers);
-    } catch (error) {
+    } catch {
       setError("Error fetching customers");
     }
   }
