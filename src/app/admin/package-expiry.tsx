@@ -31,7 +31,7 @@ export default function PackageExpiry() {
       }
       const data = await res.json();
       setSubscriptions(data.subscriptions);
-    } catch (error) {
+    } catch {
       setError("Error fetching subscriptions");
     }
   }
